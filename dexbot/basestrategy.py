@@ -1,21 +1,42 @@
+import datetime
 import logging
+import collections
 import time
 import math
 
 from .storage import Storage
 from .statemachine import StateMachine
+from .config import Config
+from .helper import truncate
 
 from events import Events
 import bitsharesapi
 import bitsharesapi.exceptions
+import bitshares.exceptions
 from bitshares.amount import Amount
 from bitshares.market import Market
 from bitshares.account import Account
 from bitshares.price import FilledOrder, Order, UpdateCallOrder
 from bitshares.instance import shared_bitshares_instance
 
-
 MAX_TRIES = 3
+
+ConfigElement = collections.namedtuple('ConfigElement', 'key type default title description extra')
+# Strategies need to specify their own configuration values, so each strategy can have
+# a class method 'configure' which returns a list of ConfigElement named tuples.
+# Tuple fields as follows:
+# - Key: the key in the bot config dictionary that gets saved back to config.yml
+# - Type: one of "int", "float", "bool", "string", "choice"
+# - Default: the default value. must be right type.
+# - Title: name shown to the user, preferably not too long
+# - Description: comments to user, full sentences encouraged
+# - Extra:
+#       For int: a (min, max, suffix) tuple
+#       For float: a (min, max, precision, suffix) tuple
+#       For string: a regular expression, entries must match it, can be None which equivalent to .*
+#       For bool, ignored
+#       For choice: a list of choices, choices are in turn (tag, label) tuples.
+#       labels get presented to user, and tag is used as the value saved back to the config dict
 
 
 class BaseStrategy(Storage, StateMachine, Events):
@@ -41,7 +62,7 @@ class BaseStrategy(Storage, StateMachine, Events):
          * ``basestrategy.log``: a per-worker logger (actually LoggerAdapter) adds worker-specific context:
             worker name & account (Because some UIs might want to display per-worker logs)
 
-        Also, Base Strategy inherits :class:`dexbot.storage.Storage`
+        Also, BaseStrategy inherits :class:`dexbot.storage.Storage`
         which allows to permanently store data in a sqlite database
         using:
 
@@ -49,9 +70,9 @@ class BaseStrategy(Storage, StateMachine, Events):
 
         .. note:: This applies a ``json.loads(json.dumps(value))``!
 
-    Workers must never attempt to interact with the user, they must assume they are running unattended
-    They can log events. If a problem occurs they can't fix they should set self.disabled = True and throw an exception
-    The framework catches all exceptions thrown from event handlers and logs appropriately.
+        Workers must never attempt to interact with the user, they must assume they are running unattended.
+        They can log events. If a problem occurs they can't fix they should set self.disabled = True and
+        throw an exception. The framework catches all exceptions thrown from event handlers and logs appropriately.
     """
 
     __events__ = [
@@ -66,10 +87,32 @@ class BaseStrategy(Storage, StateMachine, Events):
         'onUpdateCallOrder',
     ]
 
+    @classmethod
+    def configure(cls, return_base_config=True):
+        """
+        Return a list of ConfigElement objects defining the configuration values for 
+        this class
+        User interfaces should then generate widgets based on this values, gather
+        data and save back to the config dictionary for the worker.
+
+        NOTE: when overriding you almost certainly will want to call the ancestor
+        and then add your config values to the list.
+        """
+        # These configs are common to all bots
+        base_config = [
+            ConfigElement("account", "string", "", "Account", "BitShares account name for the bot to operate with", ""),
+            ConfigElement("market", "string", "USD:BTS", "Market",
+                          "BitShares market to operate on, in the format ASSET:OTHERASSET, for example \"USD:BTS\"",
+                          r"[A-Z\.]+[:\/][A-Z\.]+")
+        ]
+        if return_base_config:
+            return base_config
+        return []
+
     def __init__(
         self,
-        config,
         name,
+        config=None,
         onAccount=None,
         onOrderMatched=None,
         onOrderPlaced=None,
@@ -108,7 +151,11 @@ class BaseStrategy(Storage, StateMachine, Events):
         # Redirect this event to also call order placed and order matched
         self.onMarketUpdate += self._callbackPlaceFillOrders
 
-        self.config = config
+        if config:
+            self.config = config
+        else:
+            self.config = config = Config.get_worker_config_file(name)
+
         self.worker = config["workers"][name]
         self._account = Account(
             self.worker["account"],
@@ -139,7 +186,11 @@ class BaseStrategy(Storage, StateMachine, Events):
              'is_disabled': lambda: self.disabled}
         )
 
-    def calculate_center_price(self, suppress_errors=False):
+        self.orders_log = logging.LoggerAdapter(
+            logging.getLogger('dexbot.orders_log'), {}
+        )
+
+    def _calculate_center_price(self, suppress_errors=False):
         ticker = self.market.ticker()
         highest_bid = ticker.get("highestBid")
         lowest_ask = ticker.get("lowestAsk")
@@ -161,39 +212,47 @@ class BaseStrategy(Storage, StateMachine, Events):
         center_price = highest_bid['price'] * math.sqrt(lowest_ask['price'] / highest_bid['price'])
         return center_price
 
-    def calculate_offset_center_price(self, spread, center_price=None, order_ids=None):
+    def calculate_center_price(self, center_price=None,
+                               asset_offset=False, spread=None, order_ids=None, manual_offset=0):
         """ Calculate center price which shifts based on available funds
         """
         if center_price is None:
             # No center price was given so we simply calculate the center price
-            calculated_center_price = self.calculate_center_price()
-            center_price = calculated_center_price
+            calculated_center_price = self._calculate_center_price()
         else:
             # Center price was given so we only use the calculated center price
             # for quote to base asset conversion
-            calculated_center_price = self.calculate_center_price(True)
+            calculated_center_price = self._calculate_center_price(True)
             if not calculated_center_price:
                 calculated_center_price = center_price
 
-        total_balance = self.total_balance(order_ids)
-        total = (total_balance['quote'] * calculated_center_price) + total_balance['base']
+        if center_price:
+            calculated_center_price = center_price
 
-        if not total:  # Prevent division by zero
-            balance = 0
-        else:
-            # Returns a value between -1 and 1
-            balance = (total_balance['base'] / total) * 2 - 1
+        if asset_offset:
+            total_balance = self.total_balance(order_ids)
+            total = (total_balance['quote'] * calculated_center_price) + total_balance['base']
 
-        if balance < 0:
-            # With less of base asset center price should be offset downward
-            offset_center_price = calculated_center_price / math.sqrt(1 + spread * (balance * -1))
-        elif balance > 0:
-            # With more of base asset center price will be offset upwards
-            offset_center_price = calculated_center_price * math.sqrt(1 + spread * balance)
-        else:
-            offset_center_price = calculated_center_price
+            if not total:  # Prevent division by zero
+                balance = 0
+            else:
+                # Returns a value between -1 and 1
+                balance = (total_balance['base'] / total) * 2 - 1
 
-        return offset_center_price
+            if balance < 0:
+                # With less of base asset center price should be offset downward
+                calculated_center_price = calculated_center_price / math.sqrt(1 + spread * (balance * -1))
+            elif balance > 0:
+                # With more of base asset center price will be offset upwards
+                calculated_center_price = calculated_center_price * math.sqrt(1 + spread * balance)
+            else:
+                calculated_center_price = calculated_center_price
+
+        # Calculate final_offset_price if manual center price offset is given
+        if manual_offset:
+            calculated_center_price = calculated_center_price + (calculated_center_price * manual_offset)
+
+        return calculated_center_price
 
     @property
     def orders(self):
@@ -317,6 +376,9 @@ class BaseStrategy(Storage, StateMachine, Events):
                 return False
             else:
                 self.log.exception("Unable to cancel order")
+        except bitshares.exceptions.MissingKeyError:
+            self.log.exception('Unable to cancel order(s), private key missing.')
+
         return True
 
     def cancel(self, orders):
@@ -346,11 +408,12 @@ class BaseStrategy(Storage, StateMachine, Events):
         """
         # By default, just call cancel_all(); strategies may override this method
         self.cancel_all()
+        self.clear_orders()
 
-    def market_buy(self, amount, price, return_none=False):
+    def market_buy(self, amount, price, return_none=False, *args, **kwargs):
         symbol = self.market['base']['symbol']
         precision = self.market['base']['precision']
-        base_amount = self.truncate(price * amount, precision)
+        base_amount = truncate(price * amount, precision)
 
         # Make sure we have enough balance for the order
         if self.balance(self.market['base']) < base_amount:
@@ -372,7 +435,9 @@ class BaseStrategy(Storage, StateMachine, Events):
             price,
             Amount(amount=amount, asset=self.market["quote"]),
             account=self.account.name,
-            returnOrderId="head"
+            returnOrderId="head",
+            *args,
+            **kwargs
         )
         self.log.debug('Placed buy order {}'.format(buy_transaction))
         buy_order = self.get_order(buy_transaction['orderid'], return_none=return_none)
@@ -384,10 +449,10 @@ class BaseStrategy(Storage, StateMachine, Events):
 
         return buy_order
 
-    def market_sell(self, amount, price, return_none=False):
+    def market_sell(self, amount, price, return_none=False, *args, **kwargs):
         symbol = self.market['quote']['symbol']
         precision = self.market['quote']['precision']
-        quote_amount = self.truncate(amount, precision)
+        quote_amount = truncate(amount, precision)
 
         # Make sure we have enough balance for the order
         if self.balance(self.market['quote']) < quote_amount:
@@ -409,7 +474,9 @@ class BaseStrategy(Storage, StateMachine, Events):
             price,
             Amount(amount=amount, asset=self.market["quote"]),
             account=self.account.name,
-            returnOrderId="head"
+            returnOrderId="head",
+            *args,
+            **kwargs
         )
         self.log.debug('Placed sell order {}'.format(sell_transaction))
         sell_order = self.get_order(sell_transaction['orderid'], return_none=return_none)
@@ -433,9 +500,13 @@ class BaseStrategy(Storage, StateMachine, Events):
     def purge(self):
         """ Clear all the worker data from the database and cancel all orders
         """
-        self.cancel_all()
         self.clear_orders()
+        self.cancel_all()
         self.clear()
+
+    @staticmethod
+    def purge_worker_data(worker_name):
+        Storage.clear_worker_data(worker_name)
 
     @staticmethod
     def get_order_amount(order, asset_type):
@@ -532,8 +603,29 @@ class BaseStrategy(Storage, StateMachine, Events):
                 else:
                     raise
 
-    @staticmethod
-    def truncate(number, decimals):
-        """ Change the decimal point of a number without rounding
-        """
-        return math.floor(number * 10 ** decimals) / 10 ** decimals
+    def write_order_log(self, worker_name, order):
+        operation_type = 'TRADE'
+
+        if order['base']['symbol'] == self.market['base']['symbol']:
+            base_symbol = order['base']['symbol']
+            base_amount = -order['base']['amount']
+            quote_symbol = order['quote']['symbol']
+            quote_amount = order['quote']['amount']
+        else:
+            base_symbol = order['quote']['symbol']
+            base_amount = order['quote']['amount']
+            quote_symbol = order['base']['symbol']
+            quote_amount = -order['base']['amount']
+
+        message = '{};{};{};{};{};{};{};{}'.format(
+            worker_name,
+            order['id'],
+            operation_type,
+            base_symbol,
+            base_amount,
+            quote_symbol,
+            quote_amount,
+            datetime.datetime.now().isoformat()
+        )
+
+        self.orders_log.info(message)

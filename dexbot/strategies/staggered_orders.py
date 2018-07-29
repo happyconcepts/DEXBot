@@ -1,19 +1,47 @@
 import math
+from datetime import datetime
+from datetime import timedelta
 
-from dexbot.basestrategy import BaseStrategy
-from dexbot.queue.idle_queue import idle_add
+from dexbot.basestrategy import BaseStrategy, ConfigElement
+from dexbot.qt_queue.idle_queue import idle_add
 
 
 class Strategy(BaseStrategy):
     """ Staggered Orders strategy
     """
 
+    @classmethod
+    def configure(cls, return_base_config=True):
+        return BaseStrategy.configure(return_base_config) + [
+            ConfigElement(
+                'amount', 'float', 1, 'Amount',
+                'Fixed order size, expressed in quote asset', (0, None, 8, '')),
+            ConfigElement(
+                'spread', 'float', 6, 'Spread',
+                'The percentage difference between buy and sell', (0, None, 2, '%')),
+            ConfigElement(
+                'increment', 'float', 4, 'Increment',
+                'The percentage difference between staggered orders', (0, None, 2, '%')),
+            ConfigElement(
+                'center_price_dynamic', 'bool', True, 'Dynamic center price',
+                'Always calculate the middle from the closest market orders', None),
+            ConfigElement(
+                'center_price', 'float', 0, 'Center price',
+                'Fixed center price expressed in base asset: base/quote', (0, None, 8, '')),
+            ConfigElement(
+                'lower_bound', 'float', 1, 'Lower bound',
+                'The bottom price in the range', (0, None, 8, '')),
+            ConfigElement(
+                'upper_bound', 'float', 1000000, 'Upper bound',
+                'The top price in the range', (0, None, 8, ''))
+        ]
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.log.info("Initializing Staggered Orders")
 
         # Define Callbacks
-        self.onMarketUpdate += self.check_orders
+        self.onMarketUpdate += self.on_market_update_wrapper
         self.onAccount += self.check_orders
         self.ontick += self.tick
 
@@ -28,6 +56,9 @@ class Strategy(BaseStrategy):
         self.increment = self.worker['increment'] / 100
         self.upper_bound = self.worker['upper_bound']
         self.lower_bound = self.worker['lower_bound']
+        # Order expiration time, should be high enough
+        self.expiration = 60*60*24*365*5
+        self.last_check = datetime.now()
 
         if self['setup_done']:
             self.check_orders()
@@ -41,7 +72,6 @@ class Strategy(BaseStrategy):
             self.update_gui_slider()
 
     def error(self, *args, **kwargs):
-        self.cancel_all()
         self.disabled = True
 
     def init_strategy(self):
@@ -49,7 +79,12 @@ class Strategy(BaseStrategy):
         self.cancel_all()
         self.clear_orders()
 
-        center_price = self.calculate_center_price()
+        # Dynamic / Manual center price
+        if self.worker.get('center_price_dynamic', True):
+            center_price = self.calculate_center_price()
+        else:
+            center_price = self.worker.get('center_price')
+
         amount = self.amount
         spread = self.spread
         increment = self.increment
@@ -89,13 +124,13 @@ class Strategy(BaseStrategy):
 
         # Place the buy orders
         for buy_order in buy_orders:
-            order = self.market_buy(buy_order['amount'], buy_order['price'])
+            order = self.market_buy(buy_order['amount'], buy_order['price'], expiration=self.expiration)
             if order:
                 self.save_order(order)
 
         # Place the sell orders
         for sell_order in sell_orders:
-            order = self.market_sell(sell_order['amount'], sell_order['price'])
+            order = self.market_sell(sell_order['amount'], sell_order['price'], expiration=self.expiration)
             if order:
                 self.save_order(order)
 
@@ -114,11 +149,11 @@ class Strategy(BaseStrategy):
         if order['base']['symbol'] == self.market['base']['symbol']:  # Buy order
             price = order['price'] * (1 + self.spread)
             amount = order['quote']['amount']
-            new_order = self.market_sell(amount, price)
+            new_order = self.market_sell(amount, price, expiration=self.expiration)
         else:  # Sell order
             price = (order['price'] ** -1) / (1 + self.spread)
             amount = order['base']['amount']
-            new_order = self.market_buy(amount, price)
+            new_order = self.market_buy(amount, price, expiration=self.expiration)
 
         if new_order:
             self.remove_order(order)
@@ -130,11 +165,11 @@ class Strategy(BaseStrategy):
         if order['base']['symbol'] == self.market['base']['symbol']:  # Buy order
             price = order['price']
             amount = order['quote']['amount']
-            new_order = self.market_buy(amount, price)
+            new_order = self.market_buy(amount, price, expiration=self.expiration)
         else:  # Sell order
             price = order['price'] ** -1
             amount = order['base']['amount']
-            new_order = self.market_sell(amount, price)
+            new_order = self.market_sell(amount, price, expiration=self.expiration)
 
         self.save_order(new_order)
 
@@ -149,6 +184,15 @@ class Strategy(BaseStrategy):
 
         self.log.info("Done placing orders")
 
+    def on_market_update_wrapper(self, *args, **kwargs):
+        """ Handle market update callbacks
+        """
+        delta = datetime.now() - self.last_check
+
+        # Only allow to check orders whether minimal time passed
+        if delta > timedelta(seconds=5):
+            self.check_orders(*args, **kwargs)
+
     def check_orders(self, *args, **kwargs):
         """ Tests if the orders need updating
         """
@@ -157,6 +201,8 @@ class Strategy(BaseStrategy):
         for order_id, order in orders.items():
             current_order = self.get_order(order_id)
             if not current_order:
+                # Write order to .csv log
+                self.write_order_log(self.worker_name, order)
                 self.place_reverse_order(order)
                 order_placed = True
 
@@ -166,6 +212,8 @@ class Strategy(BaseStrategy):
         if self.view:
             self.update_gui_profit()
             self.update_gui_slider()
+
+        self.last_check = datetime.now()
 
     @staticmethod
     def calculate_buy_prices(center_price, spread, increment, lower_bound):
@@ -217,14 +265,16 @@ class Strategy(BaseStrategy):
         return [buy_orders, sell_orders]
 
     @staticmethod
-    def get_required_assets(market, amount, spread, increment, lower_bound, upper_bound):
+    def get_required_assets(market, amount, spread, increment, center_price, lower_bound, upper_bound):
         if not amount or not lower_bound or not increment:
             return None
 
         ticker = market.ticker()
         highest_bid = ticker.get("highestBid")
         lowest_ask = ticker.get("lowestAsk")
-        if not float(highest_bid):
+        if center_price:
+            pass
+        elif not float(highest_bid):
             return None
         elif not float(lowest_ask):
             return None
@@ -265,8 +315,15 @@ class Strategy(BaseStrategy):
 
     def update_gui_slider(self):
         ticker = self.market.ticker()
-        latest_price = ticker.get('latest').get('price')
-        order_ids = self.fetch_orders().keys()
+        latest_price = ticker.get('latest', {}).get('price', None)
+        if not latest_price:
+            return
+
+        orders = self.fetch_orders()
+        if orders:
+            order_ids = orders.keys()
+        else:
+            order_ids = None
         total_balance = self.total_balance(order_ids)
         total = (total_balance['quote'] * latest_price) + total_balance['base']
 

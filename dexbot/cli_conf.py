@@ -7,7 +7,7 @@ This requires a per-user systemd process to be running
 Requires the 'whiptail' tool for text-based configuration (so UNIX only)
 if not available, falls back to a line-based configurator ("NoWhiptail")
 
-Note there is some common cross-UI configuration stuff: look in basestrategy.py
+Note there is some common cross-UI configuration stuff: look in base.py
 It's expected GUI/web interfaces will be re-implementing code in this file, but they should
 understand the common code so worker strategy writers can define their configuration once
 for each strategy class.
@@ -22,9 +22,9 @@ import re
 import subprocess
 
 from dexbot.whiptail import get_whiptail
-from dexbot.basestrategy import BaseStrategy
+from dexbot.strategies.base import StrategyBase
+import dexbot.helper
 
-# FIXME: auto-discovery of strategies would be cool but can't figure out a way
 STRATEGIES = [
     {'tag': 'relative',
      'class': 'dexbot.strategies.relative_orders',
@@ -32,6 +32,17 @@ STRATEGIES = [
     {'tag': 'stagger',
      'class': 'dexbot.strategies.staggered_orders',
      'name': 'Staggered Orders'}]
+
+tags_so_far = {'stagger', 'relative'}
+for desc, module in dexbot.helper.find_external_strategies():
+    tag = desc.split()[0].lower()
+    # make sure tag is unique
+    i = 1
+    while tag in tags_so_far:
+        tag = tag+str(i)
+        i += 1
+    tags_so_far.add(tag)
+    STRATEGIES.append({'tag': tag, 'class': module, 'name': desc})
 
 SYSTEMD_SERVICE_NAME = os.path.expanduser(
     "~/.local/share/systemd/user/dexbot.service")
@@ -206,14 +217,14 @@ def configure_dexbot(config, ctx):
             worker_name = whiptail.menu("Select worker to edit", [(i, i) for i in workers])
             config['workers'][worker_name] = configure_worker(whiptail, config['workers'][worker_name])
 
-            strategy = BaseStrategy(worker_name, bitshares_instance=bitshares_instance)
-            strategy.purge()
+            strategy = StrategyBase(worker_name, bitshares_instance=bitshares_instance, config=config)
+            strategy.clear_all_worker_data()
         elif action == 'DEL':
             worker_name = whiptail.menu("Select worker to delete", [(i, i) for i in workers])
             del config['workers'][worker_name]
 
-            strategy = BaseStrategy(worker_name, bitshares_instance=bitshares_instance)
-            strategy.purge()
+            strategy = StrategyBase(worker_name, bitshares_instance=bitshares_instance, config=config)
+            strategy.clear_all_worker_data()
         elif action == 'NEW':
             txt = whiptail.prompt("Your name for the new worker")
             config['workers'][txt] = configure_worker(whiptail, {})

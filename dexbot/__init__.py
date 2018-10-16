@@ -1,4 +1,4 @@
 APP_NAME = 'dexbot'
-VERSION = '0.5.2'
+VERSION = '0.7.9'
 AUTHOR = 'Codaone Oy'
 __version__ = VERSION

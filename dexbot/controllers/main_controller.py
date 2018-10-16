@@ -3,7 +3,7 @@ import logging
 import sys
 
 from dexbot import VERSION, APP_NAME, AUTHOR
-from dexbot.helper import initialize_orders_log
+from dexbot.helper import initialize_orders_log, initialize_data_folders
 from dexbot.worker import WorkerInfrastructure
 from dexbot.views.errors import PyQtHandler
 
@@ -38,6 +38,9 @@ class MainController:
         # Configure orders logging
         initialize_orders_log()
 
+        # Initialize folders
+        initialize_data_folders()
+
     def set_info_handler(self, handler):
         self.pyqt_handler.set_info_handler(handler)
 
@@ -50,8 +53,11 @@ class MainController:
             self.worker_manager.daemon = True
             self.worker_manager.start()
 
-    def pause_worker(self, worker_name):
-        self.worker_manager.stop(worker_name, pause=True)
+    def pause_worker(self, worker_name, config=None):
+        if self.worker_manager and self.worker_manager.is_alive():
+            self.worker_manager.stop(worker_name, pause=True)
+        else:
+            self.worker_manager = WorkerInfrastructure(config, self.bitshares_instance)
 
     def remove_worker(self, worker_name):
         # Todo: Add some threading here so that the GUI doesn't freeze

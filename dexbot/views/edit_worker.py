@@ -17,10 +17,8 @@ class EditWorkerView(QtWidgets.QDialog, Ui_Dialog):
         self.setupUi(self)
         worker_data = config['workers'][worker_name]
 
-        validator = UppercaseValidator(self)
-
         # Todo: Using a model here would be more Qt like
-        # Populate the comboboxes
+        # Populate the combobox
         strategies = self.controller.strategies
         for strategy in strategies:
             self.strategy_input.addItem(strategies[strategy]['name'], strategy)
@@ -29,14 +27,16 @@ class EditWorkerView(QtWidgets.QDialog, Ui_Dialog):
         index = self.strategy_input.findData(self.controller.get_strategy_module(worker_data))
         self.strategy_input.setCurrentIndex(index)
         self.worker_name_input.setText(worker_name)
-        self.base_asset_input.addItem(self.controller.get_base_asset(worker_data))
-        self.base_asset_input.addItems(self.controller.base_assets)
+        self.base_asset_input.setText(self.controller.get_base_asset(worker_data))
         self.quote_asset_input.setText(self.controller.get_quote_asset(worker_data))
+        self.fee_asset_input.setText(worker_data.get('fee_asset', 'BTS'))
         self.account_name.setText(self.controller.get_account(worker_data))
 
-        # Validating assets fields
+        # Force uppercase to the assets fields
+        validator = UppercaseValidator(self)
         self.base_asset_input.setValidator(validator)
         self.quote_asset_input.setValidator(validator)
+        self.fee_asset_input.setValidator(validator)
 
         # Set signals
         self.strategy_input.currentTextChanged.connect(lambda: controller.change_strategy_form())

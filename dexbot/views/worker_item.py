@@ -2,6 +2,7 @@ import re
 
 from .ui.worker_item_widget_ui import Ui_widget
 from .confirmation import ConfirmationDialog
+from .worker_details import WorkerDetailsView
 from .edit_worker import EditWorkerView
 from dexbot.storage import db_worker
 from dexbot.controllers.worker_controller import WorkerController
@@ -24,6 +25,7 @@ class WorkerItemWidget(QtWidgets.QWidget, Ui_widget):
         self.setupUi(self)
 
         self.edit_button.clicked.connect(lambda: self.handle_edit_worker())
+        self.details_button.clicked.connect(lambda: self.handle_open_details())
         self.toggle.mouseReleaseEvent = lambda _: self.toggle_worker()
         self.onoff.mouseReleaseEvent = lambda _: self.toggle_worker()
 
@@ -139,10 +141,7 @@ class WorkerItemWidget(QtWidgets.QWidget, Ui_widget):
             self.remove_widget()
 
     def remove_widget(self):
-        account = self.worker_config['workers'][self.worker_name]['account']
-
         self.main_ctrl.remove_worker(self.worker_name)
-        self.main_ctrl.bitshares_instance.wallet.removeAccount(account)
         self.view.remove_worker_widget(self.worker_name)
         self.main_ctrl.config.remove_worker_config(self.worker_name)
         self.deleteLater()
@@ -154,6 +153,10 @@ class WorkerItemWidget(QtWidgets.QWidget, Ui_widget):
         self.setup_ui_data(self.worker_config)
         self._pause_worker()
 
+    def handle_open_details(self):
+        details_dialog = WorkerDetailsView(self.worker_name, self.worker_config)
+        details_dialog.exec_()
+
     @gui_error
     def handle_edit_worker(self):
         edit_worker_dialog = EditWorkerView(self, self.main_ctrl.bitshares_instance,
@@ -164,7 +167,7 @@ class WorkerItemWidget(QtWidgets.QWidget, Ui_widget):
         if return_value:
             new_worker_name = edit_worker_dialog.worker_name
             self.view.change_worker_widget_name(self.worker_name, new_worker_name)
-            self.main_ctrl.remove_worker(self.worker_name)
+            self.main_ctrl.pause_worker(self.worker_name, config=self.worker_config)
             self.main_ctrl.config.replace_worker_config(self.worker_name,
                                                         new_worker_name,
                                                         edit_worker_dialog.worker_data)

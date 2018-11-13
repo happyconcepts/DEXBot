@@ -248,6 +248,9 @@ class StrategyBase(BaseStrategy, Storage, StateMachine, Events):
             # If there is no fee asset, use BTS
             self.fee_asset = Asset('1.3.0')
 
+        # CER cache
+        self.core_exchange_rate = None
+
         # Ticker
         self.ticker = self.market.ticker
 
@@ -818,9 +821,7 @@ class StrategyBase(BaseStrategy, Storage, StateMachine, Events):
         # Get fee
         fees = self.dex.returnFees()
         limit_order_cancel = fees['limit_order_cancel']
-
-        # Convert fee
-        return self.convert_asset(limit_order_cancel['fee'], 'BTS', fee_asset)
+        return self.convert_fee(limit_order_cancel['fee'], fee_asset)
 
     def get_order_creation_fee(self, fee_asset):
         """ Returns the cost of creating an order in the asset specified
@@ -831,9 +832,7 @@ class StrategyBase(BaseStrategy, Storage, StateMachine, Events):
         # Get fee
         fees = self.dex.returnFees()
         limit_order_create = fees['limit_order_create']
-
-        # Convert fee
-        return self.convert_asset(limit_order_create['fee'], 'BTS', fee_asset)
+        return self.convert_fee(limit_order_create['fee'], fee_asset)
 
     def filter_buy_orders(self, orders, sort=None):
         """ Return own buy orders from list of orders. Can be used to pick buy orders from a list
@@ -856,12 +855,13 @@ class StrategyBase(BaseStrategy, Storage, StateMachine, Events):
 
         return buy_orders
 
-    def filter_sell_orders(self, orders, sort=None):
+    def filter_sell_orders(self, orders, sort=None, invert=True):
         """ Return sell orders from list of orders. Can be used to pick sell orders from a list
             that is not up to date with the blockchain data.
 
             :param list | orders: List of orders
             :param string | sort: DESC or ASC will sort the orders accordingly, default None
+            :param bool | invert: return inverted orders or not
             :return list | sell_orders: List of sell orders only
         """
         sell_orders = []
@@ -871,7 +871,9 @@ class StrategyBase(BaseStrategy, Storage, StateMachine, Events):
             # Check if the order is buy order, by comparing asset symbol of the order and the market
             if order['base']['symbol'] != self.market['base']['symbol']:
                 # Invert order before appending to the list, this gives easier comparison in strategy logic
-                sell_orders.append(order.invert())
+                if invert:
+                    order = order.invert()
+                sell_orders.append(order)
 
         if sort:
             sell_orders = self.sort_orders_by_price(sell_orders, sort)
@@ -919,7 +921,7 @@ class StrategyBase(BaseStrategy, Storage, StateMachine, Events):
     def get_updated_order(self, order_id):
         """ Tries to get the updated order from the API. Returns None if the order doesn't exist
 
-            :param str|dict order: blockchain Order object or id of the order
+            :param str|dict order_id: blockchain Order object or id of the order
         """
         if isinstance(order_id, dict):
             order_id = order_id['id']
@@ -931,9 +933,14 @@ class StrategyBase(BaseStrategy, Storage, StateMachine, Events):
                 order = limit_order
                 break
         else:
-            # We are using direct rpc call here because passing an Order object to self.get_updated_limit_order() give us
-            # weird error "Object of type 'BitShares' is not JSON serializable"
+            # We are using direct rpc call here because passing an Order object to self.get_updated_limit_order() give
+            # us weird error "Object of type 'BitShares' is not JSON serializable"
             order = self.bitshares.rpc.get_objects([order_id])[0]
+
+        # Do not try to continue whether there is no order in the blockchain
+        if not order:
+            return None
+
         updated_order = self.get_updated_limit_order(order)
         return Order(updated_order, bitshares_instance=self.bitshares)
 
@@ -1028,7 +1035,8 @@ class StrategyBase(BaseStrategy, Storage, StateMachine, Events):
             self.disabled = True
             return None
 
-        self.log.info('Placing a buy order for {} {} @ {:.8f}'.format(base_amount, symbol, price))
+        self.log.info('Placing a buy order for {:.{prec}f} {} @ {:.8f}'
+                      .format(base_amount, symbol, price, prec=precision))
 
         # Place the order
         buy_transaction = self.retry_action(
@@ -1081,7 +1089,8 @@ class StrategyBase(BaseStrategy, Storage, StateMachine, Events):
             self.disabled = True
             return None
 
-        self.log.info('Placing a sell order for {} {} @ {:.8f}'.format(quote_amount, symbol, price))
+        self.log.info('Placing a sell order for {:.{prec}f} {} @ {:.8f}'
+                      .format(quote_amount, symbol, price, prec=precision))
 
         # Place the order
         sell_transaction = self.retry_action(
@@ -1253,6 +1262,26 @@ class StrategyBase(BaseStrategy, Storage, StateMachine, Events):
         precision = market['base']['precision']
 
         return truncate((from_value * latest_price), precision)
+
+    def convert_fee(self, fee_amount, fee_asset):
+        """ Convert fee amount in BTS to fee in fee_asset
+
+            :param float | fee_amount: fee amount paid in BTS
+            :param Asset | fee_asset: fee asset to pay fee in
+            :return: float | amount of fee_asset to pay fee
+        """
+        if isinstance(fee_asset, str):
+            fee_asset = Asset(fee_asset)
+
+        if fee_asset['id'] == '1.3.0':
+            # Fee asset is BTS, so no further calculations are needed
+            return fee_amount
+        else:
+            if not self.core_exchange_rate:
+                # Determine how many fee_asset is needed for core-exchange
+                temp_market = Market(base=fee_asset, quote=Asset('1.3.0'))
+                self.core_exchange_rate = temp_market.ticker()['core_exchange_rate']
+            return fee_amount * self.core_exchange_rate['base']['amount']
 
     @staticmethod
     def get_order(order_id, return_none=True):
